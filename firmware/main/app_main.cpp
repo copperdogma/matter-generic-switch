@@ -340,6 +340,14 @@ extern "C" void app_main()
     err = led_indicator_init(CONFIG_LED_INDICATOR_GPIO_NUM);
     ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to initialize LED indicator, err:%d", err));
 
+    // Boot LED behavior: on 3s, blink 3 times, then off
+    led_indicator_set_bright();
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    led_indicator_set_blink();
+    // Wait long enough for 3 blinks to complete (BLINK_COUNT * 2 * period)
+    vTaskDelay(pdMS_TO_TICKS(3 * 2 * 150 + 200));
+    led_indicator_set_off();
+
     /* Create a Matter node and add the mandatory Root Node device type on endpoint 0 */
     node::config_t node_config{}; // Explicitly zero-initialize
 

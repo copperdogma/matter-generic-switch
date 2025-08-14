@@ -31,11 +31,18 @@ esp_err_t led_indicator_set_dim(void);
 esp_err_t led_indicator_set_blink(void);
 
 /**
- * @brief Set the LED indicator to full brightness (occupancy active)
+ * @brief Set the LED indicator to full brightness (active)
  * 
  * @return esp_err_t ESP_OK on success, error code otherwise
  */
 esp_err_t led_indicator_set_bright(void);
+
+/**
+ * @brief Turn the LED completely off
+ * 
+ * @return esp_err_t ESP_OK on success, error code otherwise
+ */
+esp_err_t led_indicator_set_off(void);
 
 /**
  * @brief Deinitialize the LED indicator

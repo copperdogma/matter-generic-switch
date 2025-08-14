@@ -28,6 +28,12 @@ static int s_blink_counter = 0;
 // Function prototypes
 static void blink_timer_callback(void *arg);
 
+static inline void set_duty(uint32_t duty)
+{
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, duty);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+}
+
 esp_err_t led_indicator_init(int gpio_num) {
     if (s_led_gpio != -1) {
         ESP_LOGW(TAG, "LED indicator already initialized");
@@ -64,8 +70,8 @@ esp_err_t led_indicator_init(int gpio_num) {
     };
     ESP_ERROR_CHECK(esp_timer_create(&blink_timer_args, &s_blink_timer));
 
-    // Initialize with dim brightness
-    ESP_ERROR_CHECK(led_indicator_set_dim());
+    // Startup sequence will be driven by app_main; ensure LED off by default
+    set_duty(0);
 
     ESP_LOGI(TAG, "LED indicator initialized on GPIO %d", s_led_gpio);
     return ESP_OK;
@@ -83,8 +89,7 @@ esp_err_t led_indicator_set_dim(void) {
     }
 
     // Set to dim brightness
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, DUTY_CYCLE_DIM));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+    set_duty(DUTY_CYCLE_DIM);
 
     ESP_LOGD(TAG, "LED indicator set to dim");
     return ESP_OK;
@@ -102,8 +107,7 @@ esp_err_t led_indicator_set_bright(void) {
     }
 
     // Set to full brightness
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, DUTY_CYCLE_BRIGHT));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+    set_duty(DUTY_CYCLE_BRIGHT);
 
     ESP_LOGD(TAG, "LED indicator set to bright");
     return ESP_OK;
@@ -121,8 +125,7 @@ esp_err_t led_indicator_set_blink(void) {
     }
 
     // Set to bright initially
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, DUTY_CYCLE_BRIGHT));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+    set_duty(DUTY_CYCLE_BRIGHT);
 
     // Start blinking timer for rapid flashing
     s_blink_counter = 0;
@@ -130,6 +133,19 @@ esp_err_t led_indicator_set_blink(void) {
     s_is_blinking = true;
 
     ESP_LOGD(TAG, "LED indicator set to flash 3 times");
+    return ESP_OK;
+}
+
+esp_err_t led_indicator_set_off(void)
+{
+    if (s_led_gpio == -1) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_is_blinking) {
+        esp_timer_stop(s_blink_timer);
+        s_is_blinking = false;
+    }
+    set_duty(0);
     return ESP_OK;
 }
 
@@ -151,8 +167,7 @@ esp_err_t led_indicator_deinit(void) {
     }
 
     // Turn off the LED
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, 0));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+    set_duty(0);
 
     s_led_gpio = -1;
     ESP_LOGI(TAG, "LED indicator deinitialized");
@@ -165,22 +180,19 @@ static void blink_timer_callback(void *arg) {
     // Toggle LED state
     if (led_state) {
         // Turn off
-        ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, 0);
+        set_duty(0);
     } else {
         // Turn on bright
-        ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, DUTY_CYCLE_BRIGHT);
+        set_duty(DUTY_CYCLE_BRIGHT);
         
         // Count completed blink cycles (one on-off cycle)
         s_blink_counter++;
         
-        // After BLINK_COUNT cycles, switch to steady bright
+        // After BLINK_COUNT cycles, stop blinking and leave off
         if (s_blink_counter >= BLINK_COUNT) {
-            // Stop the timer
             esp_timer_stop(s_blink_timer);
             s_is_blinking = false;
-            
-            // Set to steady bright
-            led_indicator_set_bright();
+            set_duty(0);
             return;
         }
     }
