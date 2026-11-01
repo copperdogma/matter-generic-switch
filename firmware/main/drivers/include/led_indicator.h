@@ -16,15 +16,14 @@ extern "C" {
 esp_err_t led_indicator_init(int gpio_num);
 
 /**
- * @brief Set the LED indicator to dim state (device is on, no motion detected)
+ * @brief Set the LED indicator to dim brightness
  * 
  * @return esp_err_t ESP_OK on success, error code otherwise
  */
 esp_err_t led_indicator_set_dim(void);
 
 /**
- * @brief Set the LED indicator to flash 3 times rapidly (motion detected)
- * and then automatically change to bright state
+ * @brief Flash the LED three times for a button event, then turn off
  * 
  * @return esp_err_t ESP_OK on success, error code otherwise
  */
@@ -53,4 +52,4 @@ esp_err_t led_indicator_deinit(void);
 
 #ifdef __cplusplus
 }
-#endif 
+#endif

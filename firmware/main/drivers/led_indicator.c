@@ -24,6 +24,7 @@ static int s_led_gpio = -1;
 static bool s_is_blinking = false;
 static esp_timer_handle_t s_blink_timer = NULL;
 static int s_blink_counter = 0;
+static bool s_blink_led_on = false;
 
 // Function prototypes
 static void blink_timer_callback(void *arg);
@@ -87,6 +88,8 @@ esp_err_t led_indicator_set_dim(void) {
         esp_timer_stop(s_blink_timer);
         s_is_blinking = false;
     }
+    s_blink_counter = 0;
+    s_blink_led_on = false;
 
     // Set to dim brightness
     set_duty(DUTY_CYCLE_DIM);
@@ -105,6 +108,8 @@ esp_err_t led_indicator_set_bright(void) {
         esp_timer_stop(s_blink_timer);
         s_is_blinking = false;
     }
+    s_blink_counter = 0;
+    s_blink_led_on = false;
 
     // Set to full brightness
     set_duty(DUTY_CYCLE_BRIGHT);
@@ -124,11 +129,12 @@ esp_err_t led_indicator_set_blink(void) {
         s_blink_counter = 0;
     }
 
-    // Set to bright initially
+    // Start every sequence in a known phase with the first pulse on.
+    s_blink_counter = 0;
+    s_blink_led_on = true;
     set_duty(DUTY_CYCLE_BRIGHT);
 
     // Start blinking timer for rapid flashing
-    s_blink_counter = 0;
     ESP_ERROR_CHECK(esp_timer_start_periodic(s_blink_timer, BLINK_PERIOD_MS * 1000));
     s_is_blinking = true;
 
@@ -145,6 +151,8 @@ esp_err_t led_indicator_set_off(void)
         esp_timer_stop(s_blink_timer);
         s_is_blinking = false;
     }
+    s_blink_counter = 0;
+    s_blink_led_on = false;
     set_duty(0);
     return ESP_OK;
 }
@@ -159,6 +167,8 @@ esp_err_t led_indicator_deinit(void) {
         esp_timer_stop(s_blink_timer);
         s_is_blinking = false;
     }
+    s_blink_counter = 0;
+    s_blink_led_on = false;
 
     // Delete the timer
     if (s_blink_timer) {
@@ -175,28 +185,25 @@ esp_err_t led_indicator_deinit(void) {
 }
 
 static void blink_timer_callback(void *arg) {
-    static bool led_state = true;
-    
-    // Toggle LED state
-    if (led_state) {
-        // Turn off
+    (void)arg;
+    if (!s_is_blinking) {
+        return;
+    }
+
+    if (s_blink_led_on) {
+        // Complete one visible pulse at its off transition.
         set_duty(0);
-    } else {
-        // Turn on bright
-        set_duty(DUTY_CYCLE_BRIGHT);
-        
-        // Count completed blink cycles (one on-off cycle)
+        s_blink_led_on = false;
         s_blink_counter++;
-        
-        // After BLINK_COUNT cycles, stop blinking and leave off
+
+        // After exactly three pulses, stop with the LED off.
         if (s_blink_counter >= BLINK_COUNT) {
             esp_timer_stop(s_blink_timer);
             s_is_blinking = false;
-            set_duty(0);
             return;
         }
+    } else {
+        set_duty(DUTY_CYCLE_BRIGHT);
+        s_blink_led_on = true;
     }
-    
-    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-    led_state = !led_state;
-} 
+}

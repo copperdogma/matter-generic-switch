@@ -13,6 +13,10 @@
 #include <esp_matter.h>
 #include <esp_matter_ota.h>
 #include <nvs_flash.h>
+#include <esp_event.h>
+#include <esp_wifi.h>
+#include <esp_netif.h>
+#include <app/clusters/switch-server/CodegenIntegration.h>
 
 // Include the sdkconfig.h file to access Kconfig values
 #include "sdkconfig.h"
@@ -26,7 +30,7 @@
 #include "button_gpio.h"
 
 // For VID/PID and Onboarding Codes (official example method)
-#include <app/server/OnboardingCodesUtil.h>
+#include <setup_payload/OnboardingCodesUtil.h>
 
 // Attempting to include ESP32 specific config to resolve GetVendorId issue
 #include <platform/ConfigurationManager.h> // Base interface
@@ -37,20 +41,69 @@
 
 #include <esp_matter_event.h>
 #include <esp_console.h>
-#include <esp_vfs_dev.h>
 
 static const char *TAG = "app_main";
 
-// Use the Kconfig value directly
+static void configure_wifi_selection()
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    esp_err_t err = esp_event_loop_create_default();
+    ESP_ERROR_CHECK(err == ESP_ERR_INVALID_STATE ? ESP_OK : err);
+    wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    // USB-powered button: prioritize timely packet delivery over modem sleep.
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+    wifi_config_t saved{};
+    ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &saved));
+    // Preserve credentials/security settings. Search all matching APs by signal,
+    // rather than accepting the first match from the legacy fast-scan profile.
+    // This also updates already-commissioned devices; CHIP's Kconfig setting
+    // alone only affects newly supplied network credentials.
+    if (saved.sta.ssid[0] != 0 &&
+        (saved.sta.scan_method != WIFI_ALL_CHANNEL_SCAN || saved.sta.sort_method != WIFI_CONNECT_AP_BY_SIGNAL)) {
+        saved.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+        saved.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &saved));
+    }
+    ESP_LOGI(TAG, "Wi-Fi selection: all-channel signal ranking; saved BSSID pin=%s",
+             saved.sta.bssid_set ? "yes" : "no");
+    // Matter initializes the station netif and starts/manages the connection.
+}
+
+// Observe the SDK's connection manager; do not compete with it by reconnecting here.
+static void wifi_diagnostic_event(void *, esp_event_base_t, int32_t id, void *data)
+{
+    if (id == WIFI_EVENT_STA_DISCONNECTED) {
+        auto *event = static_cast<wifi_event_sta_disconnected_t *>(data);
+        ESP_LOGW(TAG, "Wi-Fi disconnected: reason=%u, RSSI=%d dBm", event->reason, event->rssi);
+    } else if (id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "Wi-Fi associated; waiting for IP connectivity");
+    }
+}
+
+static void wifi_diagnostic_task(void *)
+{
+    for (;;) {
+        wifi_ap_record_t ap{};
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            esp_netif_ip_info_t ip{};
+            auto *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+            const bool ipv4_ready = netif && esp_netif_get_ip_info(netif, &ip) == ESP_OK && ip.ip.addr != 0;
+            ESP_LOGI(TAG, "Wi-Fi link: RSSI=%d dBm, channel=%u, IPv4=%s", ap.rssi, ap.primary,
+                     ipv4_ready ? "ready" : "waiting");
+        } else {
+            ESP_LOGW(TAG, "Wi-Fi link: not associated (SDK manages reconnection)");
+        }
+        vTaskDelay(pdMS_TO_TICKS(30000));
+    }
+}
 
 using namespace esp_matter;
 using namespace esp_matter::attribute;
 using namespace esp_matter::endpoint;
 using namespace chip::app::Clusters;
-
-// Define reset button GPIO
-#define BUTTON_GPIO CONFIG_BSP_BUTTON_GPIO  // GPIO 9 on ESP32-C3 SuperMini
-#define BSP_BUTTON_NUM 0
 
 static void open_commissioning_window_if_necessary()
 {
@@ -150,31 +203,19 @@ static esp_err_t factory_reset_button_register()
     return app_reset_button_register(push_button);
 }
 
-// AFTER factory_reset_button_register(), add switch button callback registration
-
 /* -------------------------------------------------------------------------- */
 /* Generic Switch button callback                                             */
 /* -------------------------------------------------------------------------- */
 
 static uint16_t g_switch_endpoint_id = 0;
-static uint16_t g_ui_endpoint_id = 0; // On/Off endpoint for Home UI
 
-static void switch_button_event(void *btn_handle, void *usr_data)
+// Switch attributes are now owned by a server cluster, not the legacy writer.
+// Call with the Matter stack lock held, after server startup.
+static void set_switch_position(uint8_t position)
 {
-    ESP_LOGI(TAG, "Generic Switch: Button pressed (GPIO 3)");
-
-    // Optional: flash LED three times to give feedback
-    led_indicator_set_blink();
-
-    // Update Switch cluster CurrentPosition attribute (toggle 0/1)
-    attribute_t * attr = attribute::get(g_switch_endpoint_id, chip::app::Clusters::Switch::Id,
-                                        chip::app::Clusters::Switch::Attributes::CurrentPosition::Id);
-    if (attr) {
-        esp_matter_attr_val_t val = esp_matter_invalid(NULL);
-        attribute::get_val(attr, &val);
-        val.val.u8 = (val.val.u8 == 0) ? 1 : 0;
-        attribute::update(g_switch_endpoint_id, chip::app::Clusters::Switch::Id,
-                          chip::app::Clusters::Switch::Attributes::CurrentPosition::Id, &val);
+    auto *server = Switch::FindClusterOnEndpoint(g_switch_endpoint_id);
+    if (server == nullptr || server->SetCurrentPosition(position) != CHIP_NO_ERROR) {
+        ESP_LOGE(TAG, "Failed to set Switch CurrentPosition to %u", position);
     }
 }
 
@@ -182,7 +223,6 @@ static esp_err_t register_switch_button()
 {
     button_config_t cfg = {
         .long_press_time = 1000,
-        // 150 ms threshold so typical human clicks count as "short" for single/double-click detection
         .short_press_time = 150,
     };
 
@@ -199,85 +239,31 @@ static esp_err_t register_switch_button()
         return ESP_FAIL;
     }
 
-    // Register callbacks mapped to Matter Switch Events
-
-    // Helper lambda to bind specific event type
-    auto reg = [&](button_event_t ev, button_cb_t fn) {
-        iot_button_register_cb(hbtn, ev, NULL, fn, NULL);
-    };
-
-    using namespace esp_matter::cluster::switch_cluster::event;
-
-    reg(BUTTON_PRESS_DOWN, [](void*, void*) {
+    // Only momentary press/release: every physical release is one Home action.
+    // No local lamp state, gesture timeout, or multi-click classification.
+    esp_err_t err = iot_button_register_cb(hbtn, BUTTON_PRESS_DOWN, nullptr, [](void*, void*) {
         chip::DeviceLayer::StackLock lock;
-        send_initial_press(g_switch_endpoint_id, 1);
-    });
-
-    reg(BUTTON_PRESS_UP, [](void*, void*) {
-        ESP_LOGI(TAG, "Generic Switch: Short press");
-        {
-            chip::DeviceLayer::StackLock lock;
-            // Send event
-            send_short_release(g_switch_endpoint_id, 1);
-
-            // Toggle CurrentPosition attribute (0/1)
-            attribute_t * attr = attribute::get(g_switch_endpoint_id, chip::app::Clusters::Switch::Id,
-                                                chip::app::Clusters::Switch::Attributes::CurrentPosition::Id);
-            if (attr) {
-                esp_matter_attr_val_t val = esp_matter_invalid(NULL);
-                attribute::get_val(attr, &val);
-                val.val.u8 = (val.val.u8 == 0) ? 1 : 0;
-                attribute::update(g_switch_endpoint_id, chip::app::Clusters::Switch::Id,
-                                  chip::app::Clusters::Switch::Attributes::CurrentPosition::Id, &val);
-            }
-
-            // Mirror to UI OnOff attribute (toggle true/false)
-            if (g_ui_endpoint_id) {
-                attribute_t * onoff_attr = attribute::get(g_ui_endpoint_id, chip::app::Clusters::OnOff::Id,
-                                                         chip::app::Clusters::OnOff::Attributes::OnOff::Id);
-                if (onoff_attr) {
-                    esp_matter_attr_val_t oval = esp_matter_invalid(NULL);
-                    attribute::get_val(onoff_attr, &oval);
-                    oval.val.b = !oval.val.b;
-                    attribute::update(g_ui_endpoint_id, chip::app::Clusters::OnOff::Id,
-                                      chip::app::Clusters::OnOff::Attributes::OnOff::Id, &oval);
-                }
-            }
-        }
-        led_indicator_set_blink();
-    });
-
-    reg(BUTTON_LONG_PRESS_START, [](void*, void*) {
-        ESP_LOGI(TAG, "Generic Switch: Long press start");
-        {
-            chip::DeviceLayer::StackLock lock;
-            send_long_press(g_switch_endpoint_id, 1);
-        }
-    });
-
-    reg(BUTTON_LONG_PRESS_UP, [](void*, void*) {
-        {
-            chip::DeviceLayer::StackLock lock;
-            send_long_release(g_switch_endpoint_id, 1);
-        }
-    });
-
-    reg(BUTTON_DOUBLE_CLICK, [](void*, void*) {
-        ESP_LOGI(TAG, "Generic Switch: Double click");
-        {
-            chip::DeviceLayer::StackLock lock;
-            send_multi_press_complete(g_switch_endpoint_id, 1, 2);
-        }
-    });
-
-    {
-        esp_matter_attr_val_t max_val = esp_matter_uint8(2);
-        attribute::update(g_switch_endpoint_id, chip::app::Clusters::Switch::Id,
-                          chip::app::Clusters::Switch::Attributes::MultiPressMax::Id,
-                          &max_val);
+        set_switch_position(1);
+        esp_matter::cluster::switch_cluster::event::send_initial_press(g_switch_endpoint_id, 1);
+    }, nullptr);
+    if (err != ESP_OK) {
+        iot_button_delete(hbtn);
+        return err;
     }
 
-    return ESP_OK;
+    err = iot_button_register_cb(hbtn, BUTTON_PRESS_UP, nullptr, [](void*, void*) {
+        ESP_LOGI(TAG, "Generic Switch: Single press");
+        {
+            chip::DeviceLayer::StackLock lock;
+            set_switch_position(0);
+            esp_matter::cluster::switch_cluster::event::send_short_release(g_switch_endpoint_id, 1);
+        }
+        led_indicator_set_blink();
+    }, nullptr);
+    if (err != ESP_OK) {
+        iot_button_delete(hbtn);
+    }
+    return err;
 }
 
 // Simple factory reset trigger - will reset after 10 seconds
@@ -322,7 +308,9 @@ static void register_factory_reset_console_cmd()
 extern "C" void app_main()
 {
     /* Initialize the ESP NVS layer */
-    nvs_flash_init();
+    // Never erase existing credentials/fabrics as an automatic recovery action.
+    ESP_ERROR_CHECK(nvs_flash_init());
+    configure_wifi_selection();
 
     /* Initialize console for factory reset command */
     esp_console_repl_t *repl = NULL;
@@ -351,23 +339,9 @@ extern "C" void app_main()
     /* Create a Matter node and add the mandatory Root Node device type on endpoint 0 */
     node::config_t node_config{}; // Explicitly zero-initialize
 
-    // --- BEGIN CUSTOM DEVICE INFO CONFIGURATION ---
-    // When 'Device Info Provider' is 'Custom' (via menuconfig),
-    // core device identity (VID, PID, names, versions) is primarily expected
-    // from the factory NVS partition.
-    // Kconfig settings under "Device Basic Information" provide other fields.
-    // We will only set the node_label here if we want to override the Kconfig value at runtime.
-
-    // Basic Information Cluster Configuration for Root Node
-    // Set a node_label (user-visible device name for this node).
-    // This overrides any node_label set via Kconfig.
-    // If not set here, the Kconfig value (if any) will be used.
-    // strncpy(node_config.root_node.basic_information.node_label, "MyOccupancySensorRuntime", sizeof(node_config.root_node.basic_information.node_label) - 1);
-    // node_config.root_node.basic_information.node_label[sizeof(node_config.root_node.basic_information.node_label) - 1] = '\0'; // Ensure null termination
-
-    // Identify Cluster on Root Node is mandatory and typically initialized by default by the SDK.
-
-    // --- END CUSTOM DEVICE INFO CONFIGURATION ---
+    // Preserve the existing example-provider identity and commissioning profile.
+    // Persisted Wi-Fi/fabric state stays in NVS; do not import factory data or
+    // override device identity as part of an application update.
 
     node_t *node = node::create(&node_config, app_attribute_update_cb, app_identification_cb);
     ABORT_APP_ON_FAILURE(node != nullptr, ESP_LOGE(TAG, "Failed to create Matter node"));
@@ -376,31 +350,15 @@ extern "C" void app_main()
     // Create Generic Switch endpoint
     // ------------------------------------------------------------------
 
-    endpoint::generic_switch::config_t switch_cfg; // default config (momentary, 2 positions)
+    endpoint::generic_switch::config_t switch_cfg;
+    // Matter 1.6 requires explicit, conforming feature selection at creation.
+    switch_cfg.switch_cluster.feature_flags =
+        cluster::switch_cluster::feature::momentary_switch::get_id() |
+        cluster::switch_cluster::feature::momentary_switch_release::get_id();
     endpoint_t *switch_ep = endpoint::generic_switch::create(node, &switch_cfg, ENDPOINT_FLAG_NONE, NULL);
     ABORT_APP_ON_FAILURE(switch_ep != nullptr, ESP_LOGE(TAG, "Failed to create generic_switch endpoint"));
 
     g_switch_endpoint_id = endpoint::get_id(switch_ep);
-
-    // ------------------------------------------------------------------
-    // Create On/Off Light endpoint for UI representation (stateful tile)
-    // ------------------------------------------------------------------
-
-    endpoint::on_off_light::config_t light_cfg; // default
-    endpoint_t *ui_ep = endpoint::on_off_light::create(node, &light_cfg, ENDPOINT_FLAG_NONE, NULL);
-    ABORT_APP_ON_FAILURE(ui_ep != nullptr, ESP_LOGE(TAG, "Failed to create on_off_light endpoint"));
-    g_ui_endpoint_id = endpoint::get_id(ui_ep);
-
-    // Ensure OnOff starts at false (off)
-    {
-        esp_matter_attr_val_t off_val = esp_matter_bool(false);
-        attribute::update(g_ui_endpoint_id, chip::app::Clusters::OnOff::Id,
-                          chip::app::Clusters::OnOff::Attributes::OnOff::Id, &off_val);
-    }
-
-    // Register button on GPIO3 to drive the switch events/attributes
-    err = register_switch_button();
-    ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to register switch button"));
 
 #if CHIP_DEVICE_CONFIG_ENABLE_THREAD
     /* Set OpenThread platform config */
@@ -415,6 +373,15 @@ extern "C" void app_main()
     /* Matter start */
     err = esp_matter::start(app_event_cb);
     ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to start Matter, err:%d", err));
+
+    // Register input only after the native Switch server exists.
+    err = register_switch_button();
+    ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to register switch button"));
+    ESP_LOGI(TAG, "Momentary button ready on endpoint %u; no simulated lamp endpoint", g_switch_endpoint_id);
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_diagnostic_event, nullptr));
+    ABORT_APP_ON_FAILURE(xTaskCreate(wifi_diagnostic_task, "wifi_diagnostics", 3072, nullptr, 1, nullptr) == pdPASS,
+                         ESP_LOGE(TAG, "Failed to create Wi-Fi diagnostics task"));
 
     // PrintOnboardingCodes will log the necessary VID/PID and commissioning info
     chip::DeviceLayer::StackLock lock; // RAII lock for Matter stack

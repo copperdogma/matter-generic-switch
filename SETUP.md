@@ -1,228 +1,89 @@
-# ESP32 Matter Generic Switch - Development Environment Setup
+# ESP32 Matter Generic Switch — build and update
 
-## Quick Reference
+## Pinned platform
 
-```bash
-# Source environment (required for each terminal session)
-source ~/esp/esp-idf/export.sh
-source ~/esp/esp-matter/export.sh
+The `sensors` ESP-IDF project targets the ESP32-C3. Application v2.1.1 uses:
 
-# Build and flash for ESP32-C3
-cd firmware
-idf.py set-target esp32c3
-idf.py reconfigure
-idf.py build
-idf.py -p /dev/tty.usbmodemXXX flash monitor
-```
+- ESP-IDF **v6.0.2**
+- managed `espressif/esp_matter` **1.6.1**, resolved by `firmware/main/idf_component.yml` and `firmware/dependencies.lock`
 
-## Prerequisites
+Use the versioned ESP-IDF export script. Do not source a separate esp-matter environment or replace this project's example identity providers with another project's factory profile.
 
-Before you begin, ensure your development host (Linux, macOS, or Windows with WSL) meets the prerequisites for ESP-IDF:
-- Python 3.8 or newer
-- Git
-- CMake & Ninja
-- Relevant compilers for your OS
-
-Refer to the [ESP-IDF Get Started Guide](https://docs.espressif.com/projects/esp-idf/en/v5.4.1/esp32c3/get-started/index.html) for detailed, OS-specific instructions.
-
-**ESP32-C3 SuperMini Reference:** [https://github.com/sidharthmohannair/Tutorial-ESP32-C3-Super-Mini](https://github.com/sidharthmohannair/Tutorial-ESP32-C3-Super-Mini)
-
-## 1. Initial Setup
-
-### 1.1 Optional: Clean Previous Installations
-
-If you have existing ESP-IDF/ESP-Matter installations in the `~/esp` directory that you want to remove:
-
-```bash
-rm -rf ~/esp
-```
-
-### 1.2 ESP-IDF Setup
-
-```bash
-mkdir -p ~/esp
-cd ~/esp
-git clone -b v5.4.1 --recursive https://github.com/espressif/esp-idf.git
-cd ~/esp/esp-idf
-./install.sh esp32c3
-```
-
-### 1.3 ESP-Matter Setup
-
-```bash
-cd ~/esp
-git clone --recursive https://github.com/espressif/esp-matter.git
-cd ~/esp/esp-matter
-./install.sh
-```
-
-If submodule cloning fails with 502/503 errors:
-```bash
-git submodule update --init --recursive --force
-```
-
-## 2. Environment Management
-
-For each new terminal session, source both environment scripts in this order:
-
-```bash
-source ~/esp/esp-idf/export.sh
-source ~/esp/esp-matter/export.sh
-```
-
-To verify your environment is correctly set up:
-```bash
+```sh
+source "$HOME/esp/esp-idf-v6.0.2/export.sh"
 idf.py --version
-chip-cert --version
-which python3  # Should point to ESP-IDF Python env (~/.espressif/python_env/...)
 ```
 
-## 3. Project Setup and Configuration
+Confirm the reported version is ESP-IDF v6.0.2. If needed, install it in a separate versioned directory using Espressif's instructions. Do not delete or replace `~/esp` or another existing SDK installation.
 
-### 3.1 Validate Environment with Example
+## Build
 
-```bash
-cd /path/to/your/projects_directory
-mkdir -p matter-generic-switch/firmware-test
-cp -r ~/esp/esp-matter/examples/light/* matter-generic-switch/firmware-test/
-cd matter-generic-switch/firmware-test
-idf.py set-target esp32c3
-idf.py build
+From the repository root:
+
+```sh
+source "$HOME/esp/esp-idf-v6.0.2/export.sh"
+cd firmware
+idf.py -B ../build_sdk6 -D SDKCONFIG="$PWD/sdkconfig.sdk6" -D IDF_TARGET=esp32c3 build
 ```
 
-### 3.2 Create the Generic Switch Project
+The absolute `SDKCONFIG` path avoids resolving the file relative to the separate build directory. Keep the build directory and sdkconfig isolated from older SDK builds. Use the tracked managed-component lockfile; do not independently update CHIP or use a mutable esp-matter branch.
 
-```bash
-cd /path/to/your/projects_directory
-mkdir -p matter-generic-switch/firmware
-cp -r ~/esp/esp-matter/examples/sensors/* matter-generic-switch/firmware/
-cd matter-generic-switch/firmware
-idf.py set-target esp32c3
+## v2.1.0 device behavior
+
+The v2.1.0 Matter device has only application endpoint 1, a momentary Generic Switch with the MomentarySwitch and MomentarySwitchRelease features. It has two positions: a press sets position 1; every physical release emits one ShortRelease event and sets position 0. Long-press and multi-press classification are not enabled, and the application does not wait for a double-click window. The simulated On/Off Light endpoint 2 and local On/Off toggle are removed.
+
+For the Apple Home **Single Press** action, toggle the actual lamp by reading that lamp's current On/Off state and commanding its opposite. The targets are the momentary button accessory and its target lamp. The owner configured the conditional Single Press shortcut on iPhone/iPad and confirmed physical presses toggle the lamp in both directions; the inspected Mac editor exposes fixed On/Off actions but no shortcut conversion. Legacy automation rules were left untouched; the new Single Press action has owner acceptance.
+
+Hardware and identity configuration to preserve:
+
+- Project name `sensors`; GPIO3 button is active-low with internal pull-up.
+- GPIO5 status LED; GPIO9 factory-reset button is active-low with internal pull-up (hold 5 seconds, then release).
+- Keep the current Wi-Fi policy/configuration and the two-slot OTA map (`ota_0`, `ota_1`).
+- Preserve NVS, OTA metadata, secure-certificate storage, and `fctry` identity partition.
+- Retain this project's example DAC, commissionable-data, and device-instance-info providers. Do not import the sibling occupancy project's factory-data/provider profile.
+
+## Safe application update
+
+The v2.0.0 private upgrade backup remains at:
+
+```text
+~/.local/share/matter-generic-switch/2026-10-31-upgrade/
 ```
 
-### 3.3 Configure the Project
+The current v2.1.0 private artifacts and pre-flash backup are kept separately at:
 
-Run menuconfig:
-```bash
-idf.py menuconfig
+```text
+~/.local/share/matter-generic-switch/2026-10-31-momentary-only/
 ```
 
-Apply these key settings:
+Before writing firmware, confirm the connected device is the intended ESP32-C3 and compare its partition table with `firmware/partitions.csv`. Inspect the generated table and `../build_sdk6/flash_args`; verify application slots and retained data partitions match. Stop if the map differs. Keep both backup directories private because their contents can include device-specific data.
 
-| Section | Setting | Value |
-|---------|---------|-------|
-| **Component config → CHIP Device Layer → Device Identification Options** | | |
-| | Device Vendor Id | 0xFFF1 |
-| | Device Product Id | 0x8000 |
-| | Default Device Hardware Version | 1 |
-| | Device Software Version Number | 1 |
-| | Default Device type | 22 (Root Node) |
-| **Component config → ESP Matter** | | |
-| | Device Info Provider options | Device Info – Custom |
-| | Use ESP-Matter Data Model | ✓ (Checked) |
-| | Enable Matter Server | ✓ (Checked) |
-| | Initialize Thread Stack | ✗ (Unchecked) |
+Flash the application only, substituting the serial port identified on the current machine:
 
-Scroll farther down to **Component config → ESP Matter → Select Supported Matter Clusters** and set:
-
-The menu item lists every cluster that can be compiled into your firmware.  Leave **Basic** and **Identify** enabled (they are mandatory on the root node) and make sure **Switch** and **Switch Events** stay enabled.  You may un-check large, unused clusters (Light, Thermostat, OTA Provider, etc.) to save flash/RAM, but it is optional.
-
-> Device-type assignment (e.g. "Generic Switch") is done entirely in `app_main.cpp` when you call `generic_switch::create(...)`.  The menu does **not** include a "Device Types" page in recent ESP-Matter releases.
-
-Build the project:
-```bash
-idf.py build
+```sh
+idf.py -B ../build_sdk6 -D SDKCONFIG="$PWD/sdkconfig.sdk6" -D IDF_TARGET=esp32c3 \
+  -p /dev/cu.usbmodemXXXX app-flash monitor
 ```
 
-## 4. Matter Development Certificates
+Do not use `flash`, `erase-flash`, raw `write-flash`, factory-NVS generation, or commands that write the partition table, NVS, secure-certificate, OTA metadata, or `fctry` partitions. Application-only flashing preserves commissioning and identity state.
 
-Create a directory for certificates:
-```bash
-mkdir -p matter-generic-switch/credentials/dev-certs
-cd matter-generic-switch/credentials/dev-certs
-```
+## Validation status
 
-### 4.1 Generate Certificate Chain
+The v2.1.1 maintenance image passed both firmware builds and the LED regression, was flashed application-only with hash verification, and completed a 70-second boot/network observation with both fabrics restored and no Wi-Fi disconnects or unexpected resets. See [the release validation report](docs/validation/2026-10-31-release.md) for evidence and limits.
 
-```bash
-# Product Attestation Authority (PAA)
-chip-cert gen-att-cert --type a -O PAA_key.pem --out PAA_cert.pem \
-  --subject-cn "Matter Test PAA" \
-  --valid-from "2023-01-01 00:00:00" --lifetime 7305
 
-# Product Attestation Intermediate (PAI)
-chip-cert gen-att-cert --type i -O PAI_key.pem --out PAI_cert.pem \
-  --subject-cn "Matter Test PAI FFF1" --subject-vid 0xFFF1 \
-  --valid-from "2023-01-01 00:00:00" --lifetime 7305 \
-  --ca-key PAA_key.pem --ca-cert PAA_cert.pem
+Run `tests/run_led_indicator_test.sh` with a host C compiler to exercise the actual LED driver against timer/LEDC fakes. The check covers repeat sequences, interrupted restart, off cancellation, exact pulse count and timer termination. This does not validate GPIO electrical timing.
 
-# Device Attestation Certificate (DAC)
-chip-cert gen-att-cert --type d -O DAC_key.pem --out DAC_cert.pem \
-  --subject-cn "Matter Test DAC FFF18000" --subject-vid 0xFFF1 --subject-pid 0x8000 \
-  --valid-from "2023-01-01 00:00:00" --lifetime 7305 \
-  --ca-key PAI_key.pem --ca-cert PAI_cert.pem
-```
+The retained example commissioning/attestation providers are a development/prototype identity. Do not treat the image as uniquely provisioned production firmware. The unused diagnostic TestEventTrigger is disabled in v2.1.1; commissioning/profile changes require their own planned migration.
 
-### 4.2 Generate Factory NVS Partition
+The v2.0.0 SDK upgrade is historical validation only. It booted as application 2.0.0 on ESP-IDF 6.0.2, restored two Matter fabrics, obtained IPv4, and passed bounded network observations; Apple Home responsiveness was subsequently owner-accepted. Details and limits are in [the v2.0.0 report](docs/research/sdk-wifi-upgrade-20261031.md).
 
-Ensure the esp-matter-mfg-tool is installed:
-```bash
-python3 -m pip install esp-matter-mfg-tool
-```
+The v2.1.0 build and application-only flash passed; boot restored both fabrics, obtained IPv4, and established a controller session. The owner confirmed two separate physical presses toggle the real target lamp in both directions. Cached Home presentation of the removed service was not independently rechecked. Do not describe the v2.0.0 results as v2.1.0 validation. Wi-Fi scanning/reconnection policy, modem-sleep configuration, and partition map remain unchanged from v2.0.0.
 
-Generate the partition binary:
-```bash
-esp-matter-mfg-tool \
-  -v 0xFFF1 -p 0x8000 \
-  --vendor-name "MyTestVendor" --product-name "GenericSwitch" \
-  --hw-ver 1 --hw-ver-str "1.0.0" \
-  --mfg-date "2024-05-21" --serial-num "GSWITCH001" \
-  --dac-key DAC_key.pem --dac-cert DAC_cert.pem \
-  --pai -c PAI_cert.pem \
-  --discriminator 3840 --passcode 20202021 \
-  --out factory_nvs_output
-```
+The QR/manual values were checked against the v2.0.0 boot. Both codes were verified unchanged during the v2.1.0 boot. Verify the current device identity before commissioning. The new state-aware Single Press action is owner-verified; legacy automation rules were not removed.
 
-Copy the NVS binary:
-```bash
-# Find the generated UUID, e.g., d6e078de-1a28-4b57-a713-be172effac1f
-cp factory_nvs_output/fff1_8000/{UUID}/{UUID}-partition.bin mfg_nvs.bin
-```
+## References
 
-## 5. Flashing Firmware and NVS Partition
-
-1. **Flash the Factory NVS Partition:**
-   ```bash
-   cd /path/to/your/project/firmware
-   python -m esptool --chip esp32c3 -p /dev/tty.usbmodemXXX write_flash 0x10000 ../credentials/dev-certs/mfg_nvs.bin
-   ```
-
-2. **Build and Flash Main Application:**
-   ```bash
-   idf.py build
-   idf.py -p /dev/tty.usbmodemXXX flash monitor
-   ```
-
-3. **Commissioning Information:**
-   After flashing, check the serial monitor for:
-   - QR code payload (e.g., `MT:Y.K90GSY00KA0648G00`) 
-   - Manual pairing code (e.g., `34970112332`)
-
-**Bootloader Mode:** The ESP32-C3 SuperMini might require being put into bootloader mode. Typically, this involves holding down the `BOOT` button (often GPIO9), pressing and releasing the `RESET` (or `EN`) button, and then releasing the `BOOT` button.
-
-## 6. Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| **"gn command not found"** | Verify environment: `echo $ESP_MATTER_PATH` <br>Check for executable: `ls $ESP_MATTER_PATH/connectedhomeip/connectedhomeip/.environment/cipd/packages/pigweed/gn` |
-| **Python environment issues** | Ensure using ESP-IDF Python: `which python3` <br>Re-run ESP-IDF's `install.sh` if needed |
-| **Submodule cloning failures** | Use force flag: `git submodule update --init --recursive --force` |
-| **Build errors in C++ code** | Try full clean: `idf.py fullclean` before rebuilding |
-| **Serial Port Not Found** | Double-check the serial port name (e.g., `/dev/tty.usbmodemXXXX`). Ensure you have the necessary USB drivers (e.g., CH340/CH341 or CP210x) |
-| **Build Errors** | Carefully read the error messages. They often point to configuration issues in `sdkconfig` or problems in the code |
-| **Flashing Fails** | Ensure the board is in bootloader mode. Check the USB cable and connection. Try a different USB port |
-| **Commissioning failures** | Factory reset: Hold BOOT button (GPIO 9) for 5+ seconds, then release <br>Remove device from Matter controller app <br>QR codes remain the same after factory reset (correct behavior) |
-
-## Primary Reference Documents
-- [ESP-Matter Programming Guide](https://docs.espressif.com/projects/esp-matter/en/latest/esp32/developing.html)
-- [ESP-IDF Get Started](https://docs.espressif.com/projects/esp-idf/en/v5.4.1/esp32c3/get-started/index.html)
+- [ESP-IDF v6.0.2 documentation](https://docs.espressif.com/projects/esp-idf/en/v6.0.2/esp32c3/)
+- [ESP-Matter programming guide](https://docs.espressif.com/projects/esp-matter/en/latest/esp32/developing.html)
+- [ESP32-C3 SuperMini reference](https://github.com/sidharthmohannair/Tutorial-ESP32-C3-Super-Mini)

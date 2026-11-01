@@ -27,12 +27,15 @@ credentials/dev-certs/factory_nvs.bin/
 credentials/dev-certs/mfg_nvs.bin
 
 # Component Manager
-dependencies.lock
 managed_components/
+
+# Private firmware-upgrade artifacts stay outside this repository.
+sdkconfig.sdk6*
+build_sdk6/
 
 # CI / Testing Output (optional, but good practice)
 .pytest_cache/
 build_summary_*.xml
 app_info_*.txt
 size_info_*.txt
-pytest_embedded_log/ 
+pytest_embedded_log/
